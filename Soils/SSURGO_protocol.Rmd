@@ -1,0 +1,240 @@
+---
+title: "SOIL DB EXTRACTION"
+output: html_document
+date: "2024-06-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Create a repo for each property
+
+1.  creating a repo for each property will make your lives much easier when importing downloaded data
+2.  visit this website to learn how to to create your own [R Project](https://bookdown.org/daniel_dauber_io/r4np_book/starting-your-r-projects.html)
+3.  Once your project is set up be sure to download all files belonging to property of interest into your project
+
+## Start with running the following code to download all required packages
+
+```{r packages, echo=FALSE}
+required_packages <- c("sf", "tidyverse", "ggplot2", "rnaturalearth", 
+                       "soilDB", "dplyr", "sp", "odbc", "tigris", 
+                       "lwgeom", "data.table","knitr","kableExtra")
+
+# Function to check and install packages
+install_if_missing <- function(packages) {
+  installed <- installed.packages()
+  for (pkg in packages) {
+    if (!pkg %in% installed[, "Package"]) {
+      install.packages(pkg)
+    }
+  }
+}
+
+# Install missing packages
+install_if_missing(required_packages)
+
+# Load the libraries
+library(sf)
+library(tidyverse)
+library(ggplot2)
+library(rnaturalearth)
+library(soilDB)
+library(dplyr)
+library(sp)
+library(odbc)
+library(tigris)
+library(lwgeom)
+library(data.table)
+library(knitr)
+library(kableExtra)
+```
+
+## Download Soil Data
+
+1.  Go to the [Web Soil Survey](https://websoilsurvey.nrcs.usda.gov/app/WebSoilSurvey.aspx).
+2.  Select your state where property is located.
+3.  Download the soil data file (typically in a ZIP format) and save it to your local repository.
+4.  Unzip the zip file and extract both the spatial and tabular folder.
+
+## Download USA base map and specify state of interest
+
+\*\* here I am using texas but you can change it to any state you want by editing the text
+
+```{r basemap, echo=TRUE}
+
+tigris_use_cache = TRUE
+
+# Load USA states map
+usa <- ne_states(country = "united states of america", returnclass = "sf")
+
+# Filter USA map to include only state of interest. You can edit Texas to anything you want
+TN_BaseMap<- usa %>% filter(name %in% c("Tennessee"))
+
+ggplot()+
+  geom_sf(data = TN_BaseMap)
+
+```
+
+## Download property Shape file of interest and import it to R
+
+```{r importing , echo=TRUE}
+property_of_interest  <- st_read("C:/Users/ValentinaVaney/Documents/Oleander/Sweetgum_Stands_Tennessee.shp/Sweetgum_Stands_Tennessee.shp")
+
+```
+
+## Make sure both maps have the same projection
+
+```{r transforming, echo=TRUE}
+
+utm_crs <- st_crs(32616)  #save it as a object for easy access 
+
+# Transform Texas_Louisiana_Map to the same CRS as hello_again
+TN_BaseMap <- st_transform(TN_BaseMap, crs = utm_crs)
+
+# Transform all stands to UTM CRS
+property_of_interest <- st_transform(property_of_interest, utm_crs)
+
+# Ensure the plot includes the property data
+    # here I have inlcuded coordinates in coord_sf because property was too small to see without zooming in 
+ plotz <- ggplot() +
+  geom_sf(data = TN_BaseMap) +
+  geom_sf(data = property_of_interest, fill = "purple") +
+  labs(title = "TN Base") 
+
+# Display the plot
+print(plotz)
+
+```
+
+## Uploading websoil survey spatial data
+
+1.  IN the downloaded file of websoil survey data of your state there are 2 folders: spatial and tabular.
+2.  extract all spatial files from the spatial folder onto your R project and read in the shp. file
+
+```{r web soil survery download , echo=TRUE}
+tn_SSURGO_shp <- st_read("C:/Users/ValentinaVaney/Documents/Oleander/Tenessee/wss_gsmsoil_TN_[2016-10-13]/spatial/gsmsoilmu_a_tn.shp")
+
+tn_SSURGO_shp <- st_transform(tn_SSURGO_shp,utm_crs)
+```
+
+# Spatial join between property shape file and SSURGO shape file
+
+-   here we are merging both shapefiles based on long and lat using st_intersectio(), so that we can get a corresponding mukey for area in property
+
+```{r spatial join , echo=TRUE}
+
+intersection_planar <- st_intersection(tn_SSURGO_shp, property_of_interest)
+# you can ignore warning message 
+```
+
+## Now that you have MUKEYS for every stand we can begin reading in the tabular data and extracting:
+
+### *#cokey* , *compame* , *siteIndex*
+
+## Begin by reading in tabular data
+
+1.  go to tabular folder from downloaded data from state
+2.  select comp table and read it in using the function freads
+3.  the data frame will not have any col names but luckily i wrote a query that will assign names to cols 😊
+4.  we will also download the cforprod table but will only use it later
+
+```{r reading in tabular , echo=TRUE}
+components <- fread("C:/Users/ValentinaVaney/Documents/Oleander/Tenessee/wss_gsmsoil_TN_[2016-10-13]/tabular./comp.txt")
+
+#renaming cols so you don't have to 🐬
+components <- components |>
+  mutate(compact_r = V2, compname = V4,mukey = V108, cokey = V109) |>
+  select(mukey,cokey,compact_r,compname) |>
+  rename(MUKEY = mukey)
+
+
+
+#dowloading c_forprod table for LATERRR
+
+cforprod <- fread("C:/Users/ValentinaVaney/Documents/Oleander/Tenessee/wss_gsmsoil_TN_[2016-10-13]/tabular./cfprod.txt")
+cforprod <- cforprod |>
+  rename(plantsym = V1 , plantsciname = V2, plantcomname = V3, site_base = V4,site_i = V5, 
+         siteIndex = V6, site_2 = V7, fprod_1 = V8, fprod_2 = V9, f_prod_3 = V10, cokey = V11,cforprokey = V12)
+
+
+```
+
+## We are now merging componnets to cooresponding mukeys
+
+1.  Web soil survey uses compname to derrive site index values. Here we are extrapolating compname so that we can derive site index
+
+2.  in theory we would only need cokey but bit every cokey has a corresponding cokey. In fact very little cokeys have corresponding site index.
+
+```{r comp and spatial merge}
+components$MUKEY <- as.factor(components$MUKEY) #make mukey into a factor
+
+
+#making componenets table into a geom so that we can extract compname and cokey for property shape file
+components_geo <- merge(components, tn_SSURGO_shp , by = "MUKEY", allow.cartesian = TRUE)
+
+# Convert the geometry column to an sfc (simple features column)
+components_geo <- st_as_sf(components_geo)
+# Convert the data frame to an sf object
+components_geo <- st_as_sf(components_geo, utm_crs)
+
+#final step and making and selecting locations in property of interest
+lets_go <- st_join(intersection_planar,components_geo,by = "MUKEY")
+
+
+# we are only interested ion dominant soil series so we set compact_r to greater than 50 as a way to narrow down soil orders
+plot_lets <- lets_go |>
+  filter(compact_r >30)
+
+
+# always plot data as a way to verify your work!!!!
+ggplot() +
+  geom_sf(data = TN_BaseMap) +
+  geom_sf(data = plot_lets, aes(geometry = geometry,fill = compname))  +
+  coord_sf(xlim = c(-88.1, -87.9), ylim = c(35.5, 35.6), crs = st_crs(4326)) +
+  labs(title = "Different Soil series in Property of Interest")
+ 
+
+
+```
+
+### based on this map we can see that both Evadale and Orcadia are the dominant soil series and so we are going to check site index values for each of these soil series
+
+```{r CFORPROD table lookup , echo=TRUE}
+# grabbing cokeys from property data and checking to see what are the corresponding compnames ( soil series name)
+list_co <- plot_lets$cokey
+finding_comp_name <- components |> filter(cokey %in% list_co)
+hell_0 <- finding_comp_name$compname
+
+#grabbing all cokeys associated with those companes (soilseries)
+comp_names_needed <- components|> filter(compname %in% hell_0)
+miao <- comp_names_needed$cokey
+
+
+try_again <- cforprod |>
+  filter(cokey %in% miao)
+
+try_again <- merge(try_again,components)
+
+try_again <- try_again |>
+  select(cokey,plantsym,plantcomname,siteIndex,MUKEY,compname)
+
+library(dplyr)
+library(openxlsx)
+library(writexl)
+write_xlsx(try_again, "formatted_table.xlsx")
+
+
+# try_again%>%
+#   kable("html") %>%
+#   kable_styling() %>%
+#   column_spec(c(3,4,6), background = "lightblue")  # Highlighting the first column
+
+
+# in filter plantsym == "", choose the plant sym appropriate for the species you are trying to 
+#try_again <- try_again |>
+ # filter(plantsym == "PITA")
+
+```
+
+### 
